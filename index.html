@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Medidor de Latência</title>
+<style>
+:root{--bg:#f3f5f7;--card:#ffffff;--fg:#14202b;--muted:#5b6b7a;--line:#d6dde4;--accent:#0b6bcb;--ok:#1f8a4c;--warn:#b7791f;--bad:#c53030;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0e141a;--card:#16202a;--fg:#e6edf3;--muted:#93a4b5;--line:#2a3846;--accent:#4aa3ff;--ok:#48bb78;--warn:#ecc94b;--bad:#fc8181;color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:560px;margin:0 auto;padding-block:24px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:flex;flex-direction:column;gap:16px}
+h1{font-size:1.4rem;margin:0}
+p{margin:0;color:var(--muted)}
+button{font:inherit;font-weight:600;border:0;border-radius:12px;padding:18px;background:var(--accent);color:#fff;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button.sec{background:transparent;color:var(--accent);border:1px solid var(--line);padding:12px}
+button:focus-visible{outline:3px solid var(--fg);outline-offset:2px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:10px}
+.row{display:flex;justify-content:space-between;gap:12px;font-variant-numeric:tabular-nums}
+.row span:first-child{color:var(--muted)}
+.big{font-size:2.2rem;font-weight:700;font-variant-numeric:tabular-nums}
+.verdict{font-weight:700}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+#status{min-height:1.4em}
+</style>
+</head>
+<body>
+<main>
+<h1>Medidor de Latência</h1>
+<p>Toca 15 cliques no som e grava pelo microfone. Mede quanto o áudio demora para sair e voltar, e o quanto esse tempo varia. Deixe o volume médio e o carro em silêncio.</p>
+<button id="go">Medir</button>
+<p id="status">Pronto.</p>
+<div class="card" id="res" hidden>
+<div class="big" id="avg">–</div>
+<div class="verdict" id="verdict">–</div>
+<div class="row"><span>Variação (máx − mín)</span><span id="spread">–</span></div>
+<div class="row"><span>Desvio padrão</span><span id="sd">–</span></div>
+<div class="row"><span>Mínimo / máximo</span><span id="mm">–</span></div>
+<div class="row"><span>Cliques detectados</span><span id="hits">–</span></div>
+<div class="row"><span>Taxa de amostragem</span><span id="sr">–</span></div>
+<div class="row"><span>Modo de gravação</span><span id="mode">–</span></div>
+<div class="row"><span>Latência declarada (saída)</span><span id="decl">–</span></div>
+<button class="sec" id="copy">Copiar resultado</button>
+</div>
+</main>
+<script>
+const N = 15, GAP = 0.8, WIN = 0.75, CHIRP = 0.01;
+const $ = id => document.getElementById(id);
+const worklet = `class Rec extends AudioWorkletProcessor{constructor(){super();this.buf=new Float32Array(8192);this.n=0;this.start=-1}process(i){const ch=i[0]&&i[0][0];if(ch){if(this.start<0)this.start=currentFrame;this.buf.set(ch,this.n);this.n+=ch.length;if(this.n>=this.buf.length-128){this.port.postMessage({start:this.start,data:this.buf.slice(0,this.n)});this.n=0;this.start=-1}}return true}}registerProcessor('rec',Rec)`;
+let summary = '', stream = null;
+
+async function getMic() {
+  if (stream && stream.getAudioTracks().some(t => t.readyState === 'live')) return stream;
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  return stream;
+}
+
+async function makeRecorder(ctx, src, chunks) {
+  const urls = [
+    () => URL.createObjectURL(new Blob([worklet], { type: 'application/javascript' })),
+    () => 'data:application/javascript;charset=utf-8,' + encodeURIComponent(worklet)
+  ];
+  for (const u of urls) {
+    try {
+      await ctx.audioWorklet.addModule(u());
+      const node = new AudioWorkletNode(ctx, 'rec');
+      node.port.onmessage = e => chunks.push(e.data);
+      src.connect(node);
+      return { node, mode: 'preciso' };
+    } catch (e) {}
+  }
+  const size = 1024, node = ctx.createScriptProcessor(size, 1, 1);
+  node.onaudioprocess = e => chunks.push({ start: Math.round(e.playbackTime * ctx.sampleRate) - size, data: e.inputBuffer.getChannelData(0).slice() });
+  src.connect(node);
+  return { node, mode: 'compatível (média ±21 ms, variação exata)' };
+}
+
+function makeChirp(sr) {
+  const len = Math.round(CHIRP * sr), out = new Float32Array(len);
+  const f0 = 800, f1 = 5000;
+  for (let i = 0; i < len; i++) {
+    const t = i / sr, w = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (len - 1));
+    out[i] = w * Math.sin(2 * Math.PI * (f0 * t + (f1 - f0) * t * t / (2 * CHIRP)));
+  }
+  return out;
+}
+
+function locate(rec, recStart, tpl, from, to) {
+  const a = from - recStart, b = Math.min(to - recStart, rec.length - tpl.length);
+  if (a < 0 || b <= a) return null;
+  let best = 0, bestI = -1, sum = 0, cnt = 0;
+  for (let i = a; i < b; i++) {
+    let s = 0;
+    for (let j = 0; j < tpl.length; j++) s += rec[i + j] * tpl[j];
+    s = Math.abs(s); sum += s; cnt++;
+    if (s > best) { best = s; bestI = i; }
+  }
+  const mean = sum / cnt;
+  return { frame: bestI + recStart, ratio: mean > 0 ? best / mean : 0 };
+}
+
+const tick = () => new Promise(r => setTimeout(r, 0));
+
+async function run() {
+  $('go').disabled = true; $('res').hidden = true;
+  let ctx;
+  try {
+    $('status').textContent = 'Pedindo o microfone…';
+    const mic = await getMic();
+    ctx = new AudioContext({ latencyHint: 'interactive' });
+    const src = ctx.createMediaStreamSource(mic);
+    const chunks = [];
+    const { node, mode } = await makeRecorder(ctx, src, chunks);
+    const sink = ctx.createGain(); sink.gain.value = 0;
+    node.connect(sink); sink.connect(ctx.destination);
+    const sr = ctx.sampleRate, tpl = makeChirp(sr);
+    const buf = ctx.createBuffer(1, tpl.length, sr); buf.copyToChannel(tpl, 0);
+    const t0 = ctx.currentTime + 0.6, emits = [];
+    for (let k = 0; k < N; k++) {
+      const s = ctx.createBufferSource(); s.buffer = buf; s.connect(ctx.destination);
+      const t = t0 + k * GAP; s.start(t); emits.push(Math.round(t * sr));
+    }
+    $('status').textContent = 'Tocando os cliques…';
+    await new Promise(r => setTimeout(r, (0.6 + N * GAP + 0.4) * 1000));
+    $('status').textContent = 'Calculando…';
+    if (!chunks.length) throw new Error('o microfone não entregou áudio');
+    const first = Math.min(...chunks.map(c => c.start));
+    const end = Math.max(...chunks.map(c => c.start + c.data.length));
+    const rec = new Float32Array(end - first);
+    for (const c of chunks) rec.set(c.data, c.start - first);
+    const lat = [];
+    for (let k = 0; k < N; k++) {
+      await tick();
+      const hit = locate(rec, first, tpl, emits[k], emits[k] + Math.round(WIN * sr));
+      if (hit && hit.ratio >= 6) lat.push((hit.frame - emits[k]) / sr * 1000);
+      $('status').textContent = `Calculando… ${k + 1}/${N}`;
+    }
+    show(lat, sr, ctx, mode);
+  } catch (e) {
+    $('status').textContent = 'Erro: ' + (e && e.message ? e.message : e) + '. Confira a permissão do microfone e tente de novo.';
+  } finally {
+    if (ctx) ctx.close();
+    $('go').disabled = false;
+  }
+}
+
+function show(lat, sr, ctx, mode) {
+  $('res').hidden = false;
+  $('mode').textContent = mode;
+  $('hits').textContent = `${lat.length} de ${N}`;
+  $('sr').textContent = `${sr} Hz`;
+  const decl = ((ctx.baseLatency || 0) + (ctx.outputLatency || 0)) * 1000;
+  $('decl').textContent = decl ? decl.toFixed(1) + ' ms' : 'não informada';
+  if (lat.length < 5) {
+    $('avg').textContent = '–';
+    $('verdict').textContent = 'Poucos cliques detectados. Suba o volume e repita.';
+    $('verdict').className = 'verdict bad';
+    $('status').textContent = 'Medição incompleta.';
+    summary = `Latência: falhou (${lat.length}/${N} cliques)`;
+    return;
+  }
+  const avg = lat.reduce((a, b) => a + b, 0) / lat.length;
+  const sd = Math.sqrt(lat.reduce((a, b) => a + (b - avg) ** 2, 0) / lat.length);
+  const mn = Math.min(...lat), mx = Math.max(...lat), spread = mx - mn;
+  $('avg').textContent = avg.toFixed(1) + ' ms';
+  $('spread').textContent = spread.toFixed(1) + ' ms';
+  $('sd').textContent = sd.toFixed(1) + ' ms';
+  $('mm').textContent = `${mn.toFixed(1)} / ${mx.toFixed(1)} ms`;
+  const v = spread < 5 ? ['Estável: serve para o ANC.', 'ok'] : spread < 20 ? ['Varia um pouco: serve só em cruzeiro.', 'warn'] : ['Instável: atrapalha o cancelamento.', 'bad'];
+  $('verdict').textContent = v[0]; $('verdict').className = 'verdict ' + v[1];
+  $('status').textContent = 'Pronto. Rode de novo para confirmar.';
+  summary = `Modo ${mode} · latência média ${avg.toFixed(1)} ms · variação ${spread.toFixed(1)} ms · DP ${sd.toFixed(1)} ms · ${lat.length}/${N} cliques · ${sr} Hz · declarada ${decl ? decl.toFixed(1) + ' ms' : 'n/d'} · ${navigator.userAgent}`;
+}
+
+$('go').addEventListener('click', run);
+$('copy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(summary); $('status').textContent = 'Resultado copiado.'; }
+  catch { $('status').textContent = summary; }
+});
+</script>
+</body>
+</html>
