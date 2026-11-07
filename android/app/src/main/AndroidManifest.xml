@@ -4,7 +4,7 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
-        android:label="Medidor de Latência"
+        android:label="ANC Polo"
         android:icon="@android:drawable/ic_btn_speak_now">
         <activity
             android:name=".MainActivity"
