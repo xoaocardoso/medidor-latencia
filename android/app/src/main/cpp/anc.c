@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define RING 16384
 #define MASK (RING - 1)
@@ -57,6 +58,19 @@ static double abOn, abOff;
 static int abOnN, abOffN;
 static long long abT0;
 static volatile int gActive;
+static volatile double gLms = -1;
+static double gC, kHist[5];
+static int kHistN, gTsOk, burstF, bufBursts, xrWindow;
+static long long xrT;
+static double cwB = 1, swB = 0, WpR, WpI;
+
+static int kts(double *out) {
+    int64_t fpO, tO, fpI, tI;
+    if (AAudioStream_getTimestamp(gOut, CLOCK_MONOTONIC, &fpO, &tO) != AAUDIO_OK) return 0;
+    if (AAudioStream_getTimestamp(gIn, CLOCK_MONOTONIC, &fpI, &tI) != AAUDIO_OK) return 0;
+    *out = (double) fpI + (double) (tO - tI) * gSr / 1e9 - (double) fpO;
+    return 1;
+}
 
 static double biq(int s, double x) {
     double *c = bq[s];
@@ -97,6 +111,7 @@ static void resetTracker(void) {
     P = 1e-9;
     lockQ = 0;
     Wr = Wi = 0;
+    WpR = WpI = 0;
     badCnt = 0;
     cooldown = 0;
 }
@@ -135,7 +150,7 @@ static void inSample(double e) {
     if (w < wmin) w = wmin;
     if (w > wmax) w = wmax;
     alpha += BETA3 * (KI * err - alpha);
-    double r = w + KP * err, cr = cos(r), sr = sin(r);
+    double a = KP * err, cr = cwB - swB * a, sr = swB + cwB * a;
     double nr = pRe * cr - pIm * sr;
     pIm = pRe * sr + pIm * cr;
     pRe = nr;
@@ -183,6 +198,8 @@ static void finishCal(void) {
 
 static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, int32_t frames) {
     int16_t *out = (int16_t *) data;
+    cwB = cos(w);
+    swB = sin(w);
     for (;;) {
         aaudio_result_t got = AAudioStream_read(gIn, tmpIn, 8192, 0);
         if (got <= 0) break;
@@ -298,18 +315,22 @@ static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, in
     double ph = atan2(pIm, pRe) + w * h0 + 0.5 * alpha * h0 * h0;
     double wr = w + alpha * h0;
     double c = cos(ph), sn = sin(ph), rc = cos(wr), rs = sin(wr);
-    double gwr = gr * Wr - gi * Wi, gwi = gr * Wi + gi * Wr;
     for (int j = 0; j < frames; j++) {
-        double y = Wr * c - Wi * sn;
+        double t = (double) (j + 1) / frames;
+        double wr2 = WpR + (Wr - WpR) * t, wi2 = WpI + (Wi - WpI) * t;
+        double y = wr2 * c - wi2 * sn;
         if (y > 0.9) y = 0.9;
         if (y < -0.9) y = -0.9;
         out[j] = (int16_t) (y * 32767);
+        double gwr = gr * wr2 - gi * wi2, gwi = gr * wi2 + gi * wr2;
         cm[(int) ((oCount + K) & MASK)] = (float) (gwr * c - gwi * sn);
         double nc = c * rc - sn * rs;
         sn = c * rs + sn * rc;
         c = nc;
         oCount++;
     }
+    WpR = Wr;
+    WpI = Wi;
     double n = sqrt(pRe * pRe + pIm * pIm);
     pRe /= n;
     pIm /= n;
@@ -425,7 +446,13 @@ JNIEXPORT jstring JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_ancOpe
         return (*env)->NewStringUTF(env, "entrada nao abriu");
     }
     AAudioStreamBuilder_delete(b);
-    AAudioStream_setBufferSizeInFrames(gOut, AAudioStream_getFramesPerBurst(gOut) * 2);
+    burstF = AAudioStream_getFramesPerBurst(gOut);
+    bufBursts = 2;
+    AAudioStream_setBufferSizeInFrames(gOut, burstF * bufBursts);
+    xrT = 0;
+    xrWindow = 0;
+    gLms = -1;
+    gTsOk = 0;
 
     chirpLen = (int) (0.01 * gSr);
     for (int i = 0; i < chirpLen; i++) {
@@ -489,38 +516,79 @@ JNIEXPORT void JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_ancCmd(JN
 
 JNIEXPORT jdoubleArray JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_ancService(JNIEnv *env, jobject t) {
     if (gState == ST_DWAIT) {
-        int ks[NCHIRP], n = 0;
+        int ks[NCHIRP], ls[NCHIRP], n = 0;
         for (int i = 0; i < NCHIRP; i++) {
             int a = (int) (emitN[i] - recStart), m = findChirp(rec, recCap, a, a + (int) (0.75 * gSr));
-            if (m >= 0) ks[n++] = (int) (m + recStart - emitO[i]);
+            if (m >= 0) {
+                ks[n] = (int) (m + recStart - emitO[i]);
+                ls[n] = (int) (m + recStart - emitN[i]);
+                n++;
+            }
         }
         if (n >= 2) {
             for (int i = 1; i < n; i++) {
-                int v = ks[i], j = i - 1;
+                int v = ks[i], u = ls[i], j = i - 1;
                 while (j >= 0 && ks[j] > v) {
                     ks[j + 1] = ks[j];
+                    ls[j + 1] = ls[j];
                     j--;
                 }
                 ks[j + 1] = v;
+                ls[j + 1] = u;
             }
             gK = ks[n / 2];
+            gLms = ls[n / 2] * 1000.0 / gSr;
+            double kt;
+            gTsOk = kts(&kt);
+            if (gTsOk) gC = gK - kt;
+            kHistN = 0;
             if (gNext == ST_CAL) startCal();
             else startRun();
         } else gState = ST_ERR;
     }
     if (gState == ST_RUN) {
         if (lockQ < 0.5) coarseSearch();
-        int xr = AAudioStream_getXRunCount(gOut);
-        if (xr != lastXruns) {
-            lastXruns = xr;
-            if (gAnc) {
-                gNext = ST_RUN;
-                gReset = 1;
+        double kt;
+        if (gTsOk && kts(&kt)) {
+            kHist[kHistN % 5] = kt + gC;
+            kHistN++;
+            if (kHistN >= 5) {
+                double s[5];
+                memcpy(s, kHist, sizeof(s));
+                for (int i = 1; i < 5; i++) {
+                    double v = s[i];
+                    int j = i - 1;
+                    while (j >= 0 && s[j] > v) {
+                        s[j + 1] = s[j];
+                        j--;
+                    }
+                    s[j + 1] = v;
+                }
+                int nk = (int) lround(s[2]);
+                if (abs(nk - gK) > gSr / 1000) {
+                    gLms += (nk - gK) * 1000.0 / gSr;
+                    gK = nk;
+                }
             }
+        }
+        int xr = AAudioStream_getXRunCount(gOut);
+        long long now = oCount;
+        if (xr != lastXruns) {
+            xrWindow += xr - lastXruns;
+            lastXruns = xr;
+        }
+        if (now - xrT > (long long) gSr * 10) {
+            xrT = now;
+            xrWindow = 0;
+        } else if (xrWindow >= 2 && bufBursts < 4) {
+            bufBursts++;
+            AAudioStream_setBufferSizeInFrames(gOut, burstF * bufBursts);
+            xrWindow = 0;
+            xrT = now;
         }
     }
     double mag = sqrt(Zr * Zr + Zi * Zi), emag = sqrt(Er * Er + Ei * Ei);
-    double v[16];
+    double v[20];
     v[0] = gState;
     v[1] = w * gSr / TWO_PI;
     v[2] = lockQ;
@@ -537,8 +605,12 @@ JNIEXPORT jdoubleArray JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_a
     v[13] = resets;
     v[14] = gHasCal;
     v[15] = gState == ST_CAL ? (double) (oCount - calStartO) / (calEndO - calStartO) : 0;
-    jdoubleArray r = (*env)->NewDoubleArray(env, 16);
-    (*env)->SetDoubleArrayRegion(env, r, 0, 16, v);
+    v[16] = gLms;
+    v[17] = bufBursts;
+    v[18] = gTsOk;
+    v[19] = burstF * 1000.0 / gSr;
+    jdoubleArray r = (*env)->NewDoubleArray(env, 20);
+    (*env)->SetDoubleArrayRegion(env, r, 0, 20, v);
     return r;
 }
 
