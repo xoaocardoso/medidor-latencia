@@ -138,11 +138,11 @@ public class MainActivity extends Activity {
     void saveCal(float[] c) {
         StringBuilder s = new StringBuilder();
         for (float f : c) s.append(f).append(',');
-        prefs.edit().putString("cal", s.toString()).apply();
+        prefs.edit().putString("cal2", s.toString()).apply();
     }
 
     float[] loadCal() {
-        String s = prefs.getString("cal", null);
+        String s = prefs.getString("cal2", null);
         if (s == null) return null;
         String[] p = s.split(",");
         float[] c = new float[p.length];

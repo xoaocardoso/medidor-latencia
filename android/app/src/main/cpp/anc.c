@@ -214,7 +214,7 @@ static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, in
     if (st == ST_DMEAS) {
         for (int j = 0; j < frames; j++) {
             double v = 0;
-            if (chirpPos < 0 && nEmit < NCHIRP && oCount >= dStartO + (long long) nEmit * (gSr / 2)) {
+            if (chirpPos < 0 && nEmit < NCHIRP && oCount >= dStartO + (long long) nEmit * (long long) (0.6 * gSr)) {
                 emitO[nEmit] = oCount;
                 emitN[nEmit] = inCount;
                 nEmit++;
@@ -227,7 +227,7 @@ static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, in
             out[j] = (int16_t) (v * 0.8 * 32767);
             oCount++;
         }
-        if (nEmit == NCHIRP && chirpPos < 0 && inCount > emitN[NCHIRP - 1] + (long long) (0.8 * gSr)) gState = ST_DWAIT;
+        if (nEmit == NCHIRP && chirpPos < 0 && inCount > emitN[NCHIRP - 1] + (long long) (0.6 * gSr)) gState = ST_DWAIT;
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
     if (st == ST_CAL) {
@@ -518,7 +518,7 @@ JNIEXPORT jdoubleArray JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_a
     if (gState == ST_DWAIT) {
         int ks[NCHIRP], ls[NCHIRP], n = 0;
         for (int i = 0; i < NCHIRP; i++) {
-            int a = (int) (emitN[i] - recStart), m = findChirp(rec, recCap, a, a + (int) (0.75 * gSr));
+            int a = (int) (emitN[i] - recStart), m = findChirp(rec, recCap, a, a + (int) (0.45 * gSr));
             if (m >= 0) {
                 ks[n] = (int) (m + recStart - emitO[i]);
                 ls[n] = (int) (m + recStart - emitN[i]);
