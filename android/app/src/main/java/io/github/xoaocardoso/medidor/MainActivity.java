@@ -126,6 +126,9 @@ public class MainActivity extends Activity {
             s.append(String.format(Locale.US, "Latência real: %s | buffer %.0f × %.1f ms | relógio %s\n",
                     v[16] > 0 ? String.format(Locale.US, "%.0f ms", v[16]) : "ainda não medida", v[17], v[19], v[18] > 0 ? "ok" : "sem"));
             s.append(String.format(Locale.US, "Engasgos (xruns): %.0f | resets do limitador: %.0f\n", v[12], v[13]));
+            int ex = (int) v[20];
+            s.append(String.format(Locale.US, "Modo exclusivo: saída %s, mic %s | canais de saída %.0f\n",
+                    (ex & 2) > 0 ? "SIM" : "não", (ex & 1) > 0 ? "SIM" : "não", v[21]));
             if (v[8] > 0) {
                 if (v[11] > 0) s.append(String.format(Locale.US, "A/B: desligado %.1f dB × ligado %.1f dB → REDUÇÃO MEDIDA %.1f dB (n=%.0f)\n", v[10], v[9], v[10] - v[9], v[11]));
                 else s.append("A/B: juntando dados com o drone travado...\n");

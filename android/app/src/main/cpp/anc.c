@@ -62,7 +62,13 @@ static volatile double gLms = -1;
 static double gC, kHist[5];
 static int kHistN, gTsOk, burstF, bufBursts, xrWindow;
 static long long xrT;
-static double cwB = 1, swB = 0, WpR, WpI;
+static double cwB = 1, swB = 0, WpR, WpI, pOR = 1, pOI = 0;
+static int gOutCh = 1, gInCh = 1, gExO, gExI;
+
+static inline void put(int16_t *out, int j, double v) {
+    int16_t s = (int16_t) (v * 32767);
+    for (int c = 0; c < gOutCh; c++) out[j * gOutCh + c] = s;
+}
 
 static int kts(double *out) {
     int64_t fpO, tO, fpI, tI;
@@ -201,10 +207,11 @@ static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, in
     cwB = cos(w);
     swB = sin(w);
     for (;;) {
-        aaudio_result_t got = AAudioStream_read(gIn, tmpIn, 8192, 0);
+        int cap = 8192 / gInCh;
+        aaudio_result_t got = AAudioStream_read(gIn, tmpIn, cap, 0);
         if (got <= 0) break;
-        for (int i = 0; i < got; i++) inSample(tmpIn[i] / 32768.0);
-        if (got < 8192) break;
+        for (int i = 0; i < got; i++) inSample(tmpIn[i * gInCh] / 32768.0);
+        if (got < cap) break;
     }
     if (gReset) {
         gReset = 0;
@@ -224,7 +231,7 @@ static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, in
                 v = chirpT[chirpPos++];
                 if (chirpPos >= chirpLen) chirpPos = -1;
             }
-            out[j] = (int16_t) (v * 0.8 * 32767);
+            put(out, j, v * 0.8);
             oCount++;
         }
         if (nEmit == NCHIRP && chirpPos < 0 && inCount > emitN[NCHIRP - 1] + (long long) (0.6 * gSr)) gState = ST_DWAIT;
@@ -250,14 +257,14 @@ static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, in
                 hs[idx] = (float) sn;
                 tk[idx] = (pos > 0.12 * gSr && pos < toneLen - fade) ? (signed char) (k + 1) : 0;
             }
-            out[j] = (int16_t) (v * 32767);
+            put(out, j, v);
             oCount++;
         }
         if (inCount > calEndO + K + gSr / 20) finishCal();
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
     if (st != ST_RUN) {
-        memset(out, 0, frames * sizeof(int16_t));
+        memset(out, 0, (size_t) frames * gOutCh * sizeof(int16_t));
         oCount += frames;
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
@@ -312,16 +319,23 @@ static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, in
     if (cooldown > 0) cooldown -= frames;
 
     double h0 = (double) (oCount + K - inCount);
-    double ph = atan2(pIm, pRe) + w * h0 + 0.5 * alpha * h0 * h0;
-    double wr = w + alpha * h0;
-    double c = cos(ph), sn = sin(ph), rc = cos(wr), rs = sin(wr);
+    double tgt = atan2(pIm, pRe) + w * h0 + 0.5 * alpha * h0 * h0;
+    double pe = remainder(tgt - atan2(pOI, pOR), TWO_PI);
+    double wr = w + alpha * h0 + pe / frames;
+    int silent = (Wr * Wr + Wi * Wi) < 1e-8 && (WpR * WpR + WpI * WpI) < 1e-8;
+    if (silent || fabs(pe) > 2.5) {
+        pOR = cos(tgt);
+        pOI = sin(tgt);
+        wr = w + alpha * h0;
+    }
+    double c = pOR, sn = pOI, rc = cos(wr), rs = sin(wr);
     for (int j = 0; j < frames; j++) {
         double t = (double) (j + 1) / frames;
         double wr2 = WpR + (Wr - WpR) * t, wi2 = WpI + (Wi - WpI) * t;
         double y = wr2 * c - wi2 * sn;
         if (y > 0.9) y = 0.9;
         if (y < -0.9) y = -0.9;
-        out[j] = (int16_t) (y * 32767);
+        put(out, j, y);
         double gwr = gr * wr2 - gi * wi2, gwi = gr * wi2 + gi * wr2;
         cm[(int) ((oCount + K) & MASK)] = (float) (gwr * c - gwi * sn);
         double nc = c * rc - sn * rs;
@@ -331,6 +345,9 @@ static aaudio_data_callback_result_t cb(AAudioStream *s, void *u, void *data, in
     }
     WpR = Wr;
     WpI = Wi;
+    double on = sqrt(c * c + sn * sn);
+    pOR = c / on;
+    pOI = sn / on;
     double n = sqrt(pRe * pRe + pIm * pIm);
     pRe /= n;
     pIm /= n;
@@ -426,13 +443,20 @@ JNIEXPORT jstring JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_ancOpe
     AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setChannelCount(b, 1);
     AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_MEDIA);
+    AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_EXCLUSIVE);
     AAudioStreamBuilder_setDataCallback(b, cb, NULL);
     if (AAudioStreamBuilder_openStream(b, &gOut) != AAUDIO_OK) {
-        AAudioStreamBuilder_delete(b);
-        return (*env)->NewStringUTF(env, "saida nao abriu");
+        AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
+        if (AAudioStreamBuilder_openStream(b, &gOut) != AAUDIO_OK) {
+            AAudioStreamBuilder_delete(b);
+            return (*env)->NewStringUTF(env, "saida nao abriu");
+        }
     }
     AAudioStreamBuilder_delete(b);
     gSr = AAudioStream_getSampleRate(gOut);
+    gOutCh = AAudioStream_getChannelCount(gOut);
+    if (gOutCh < 1) gOutCh = 1;
+    gExO = AAudioStream_getSharingMode(gOut) == AAUDIO_SHARING_MODE_EXCLUSIVE;
     AAudio_createStreamBuilder(&b);
     AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_INPUT);
     AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
@@ -440,11 +464,18 @@ JNIEXPORT jstring JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_ancOpe
     AAudioStreamBuilder_setChannelCount(b, 1);
     AAudioStreamBuilder_setSampleRate(b, gSr);
     AAudioStreamBuilder_setInputPreset(b, AAUDIO_INPUT_PRESET_VOICE_PERFORMANCE);
+    AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_EXCLUSIVE);
     if (AAudioStreamBuilder_openStream(b, &gIn) != AAUDIO_OK) {
-        AAudioStreamBuilder_delete(b);
-        AAudioStream_close(gOut);
-        return (*env)->NewStringUTF(env, "entrada nao abriu");
+        AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
+        if (AAudioStreamBuilder_openStream(b, &gIn) != AAUDIO_OK) {
+            AAudioStreamBuilder_delete(b);
+            AAudioStream_close(gOut);
+            return (*env)->NewStringUTF(env, "entrada nao abriu");
+        }
     }
+    gInCh = AAudioStream_getChannelCount(gIn);
+    if (gInCh < 1) gInCh = 1;
+    gExI = AAudioStream_getSharingMode(gIn) == AAUDIO_SHARING_MODE_EXCLUSIVE;
     AAudioStreamBuilder_delete(b);
     burstF = AAudioStream_getFramesPerBurst(gOut);
     bufBursts = 2;
@@ -588,7 +619,7 @@ JNIEXPORT jdoubleArray JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_a
         }
     }
     double mag = sqrt(Zr * Zr + Zi * Zi), emag = sqrt(Er * Er + Ei * Ei);
-    double v[20];
+    double v[22];
     v[0] = gState;
     v[1] = w * gSr / TWO_PI;
     v[2] = lockQ;
@@ -609,8 +640,10 @@ JNIEXPORT jdoubleArray JNICALL Java_io_github_xoaocardoso_medidor_MainActivity_a
     v[17] = bufBursts;
     v[18] = gTsOk;
     v[19] = burstF * 1000.0 / gSr;
-    jdoubleArray r = (*env)->NewDoubleArray(env, 20);
-    (*env)->SetDoubleArrayRegion(env, r, 0, 20, v);
+    v[20] = gExO * 2 + gExI;
+    v[21] = gOutCh;
+    jdoubleArray r = (*env)->NewDoubleArray(env, 22);
+    (*env)->SetDoubleArrayRegion(env, r, 0, 22, v);
     return r;
 }
 
